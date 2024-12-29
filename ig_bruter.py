@@ -1,99 +1,121 @@
-# Version: Python 3.7.x
-# install additional module using command pip install missing_module_name
-import requests
+import aiohttp
+import asyncio
 import json
-import string
-import random
-import threading
-from queue import Queue
-import socket
+import logging
+from aiohttp import ClientSession
+from time import time
 
-threads_count = 40
-socket.setdefaulttimeout(5)
+# Constants
+THREAD_COUNT = 40
+MAX_RETRIES = 3
+CSRF_URL = 'https://www.instagram.com/accounts/login/?'
+LOGIN_URL = "https://www.instagram.com/accounts/login/ajax/"
 
-class myThread(threading.Thread):
-    def __init__(self, queue, *args):
-        self.queue = queue
-        self._args = args
-        threading.Thread.__init__(self)
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    def is_insta_acc(self, cred):
-        s = requests.Session()
-        headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36",
-            }
+
+class InstagramChecker:
+    def __init__(self):
+        self.session = None
+
+    async def _get_csrftoken(self, session: ClientSession) -> str:
+        """ Get the CSRF token required for the login request """
         try:
-            lp = s.get('https://www.instagram.com/accounts/login/?',headers=headers)
-        except:
-            return False
-        token = s.cookies.get_dict().get('csrftoken')
-        url = "https://www.instagram.com/accounts/login/ajax/"
+            async with session.get(CSRF_URL) as response:
+                response.raise_for_status()
+                return response.cookies.get('csrftoken', '')
+        except Exception as e:
+            logging.error(f"Error retrieving CSRF token: {e}")
+            return ''
+
+    async def _attempt_login(self, session: ClientSession, username: str, password: str, csrf_token: str) -> dict:
+        """ Attempt to log into Instagram with given credentials """
         params = {
-            "username": cred,
-            "enc_password": "",
+            "username": username,
+            "enc_password": password,
             "queryParams": "{\"source\":\"auth_switcher\"}",
             "optIntoOneTap": "false"
-            }
+        }
         headers = {
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br",
-            "accept-language": "en-US,en;q=0.9,bn;q=0.8",
-            "content-length": "126",
             "content-type": "application/x-www-form-urlencoded",
-            #"cookie": "mid=W5uoAwAEAAHQMrm9fx_BelLIVThw; mcd=3; ig_did=91ADCB76-A660-4BE2-8696-EA6C2C514EBB; csrftoken=ZXzr82urYV1fCvFdLvp83ecFs2QvuWqV; rur=FTW",
-            "dnt": "1",
-            "origin": "https://www.instagram.com",
-            "referer": "https://www.instagram.com/accounts/login/?source=auth_switcher",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36",
-            "x-csrftoken": token,
+            "x-csrftoken": csrf_token,
             "x-ig-app-id": "936619743392459",
-            "x-ig-www-claim": "0",
             "x-instagram-ajax": "7ba5929a3456",
-            "x-requested-with": "XMLHttpRequest"
-            }
-        try:
-            rr = s.post(url, headers=headers, data=params).text
-            return rr
-        except:
-            print("Site cannot be accessed! Increase timeout ...")
-            return json.dumps({"user":"False"})
+        }
 
-    def run(self):
-        while True:
-            acc = None
+        try:
+            async with session.post(LOGIN_URL, headers=headers, data=params) as response:
+                response.raise_for_status()
+                return await response.json()
+        except Exception as e:
+            logging.error(f"Error during Instagram login attempt: {e}")
+            return {"user": "False"}
+
+    async def is_insta_acc(self, session: ClientSession, cred: str) -> dict:
+        """ Check if an Instagram account exists based on the given number """
+        csrf_token = await self._get_csrftoken(session)
+        if not csrf_token:
+            return {"user": "False"}
+
+        retries = 0
+        while retries < MAX_RETRIES:
             try:
-                acc = self.queue.get(timeout=1)
-            except:
-                return
-            low_lim = int(acc.split(":")[0])
-            high_lim = int(acc.split(":")[1])
-            for x in range(low_lim, high_lim+1):
-                print(x)
-                try:
-                    out = json.loads(self.is_insta_acc("+"+str(x)))
-                    ans = out['user']
-                except:
-                    ans = "False"
-                if str(ans) == "True":
-                    with open("success.txt", "a+") as suc_file:
-                        suc_file.write("+" + str(x) + "\n")
-            self.queue.task_done()
+                result = await self._attempt_login(session, cred, "", csrf_token)
+                return result
+            except Exception as e:
+                logging.error(f"Attempt {retries + 1} failed for {cred}: {e}")
+                retries += 1
+                await asyncio.sleep(2)  # backoff before retrying
+
+        return {"user": "False"}
+
+
+class InstagramAccountChecker:
+    def __init__(self, input_file: str, output_file: str, thread_count: int = THREAD_COUNT):
+        self.input_file = input_file
+        self.output_file = output_file
+        self.thread_count = thread_count
+
+    async def process_range(self, session: ClientSession, low_lim: int, high_lim: int):
+        """ Process a range of phone numbers to check if they exist on Instagram """
+        instagram_checker = InstagramChecker()
+        for x in range(low_lim, high_lim + 1):
+            logging.info(f"Checking number: +{x}")
+            result = await instagram_checker.is_insta_acc(session, f"+{x}")
+            if result.get("user") == "True":
+                with open(self.output_file, "a+") as suc_file:
+                    suc_file.write(f"+{x}\n")
+
+    async def read_ranges(self):
+        """ Read account ranges from the input file and return them as a list """
+        ranges = []
+        with open(self.input_file, "r") as file:
+            for line in file:
+                line = line.strip()
+                if line:
+                    low_lim, high_lim = map(int, line.split(":"))
+                    ranges.append((low_lim, high_lim))
+        return ranges
+
+    async def start(self):
+        """ Start the account checking process using asyncio """
+        start_time = time()
+        async with ClientSession() as session:
+            ranges = await self.read_ranges()
+            tasks = []
+            for low_lim, high_lim in ranges:
+                tasks.append(self.process_range(session, low_lim, high_lim))
+
+            await asyncio.gather(*tasks)
+
+        end_time = time()
+        logging.info(f"Account checking completed in {end_time - start_time:.2f} seconds.")
+
 
 if __name__ == "__main__":
-    queue= Queue()
-    threads = []
-    for i in range(threads_count):
-        worker = myThread(queue, i)
-        worker.setDaemon(True)
-        worker.start()
-        threads.append(worker)
-    with open("list.txt", "r") as main_file:
-        for line in main_file:
-            line = line.replace("\n", "").strip()
-            if line == "":
-                continue
-            queue.put(line)
-        for item in threads:
-            item.join()
+    input_file = "list.txt"
+    output_file = "success.txt"
+
+    checker = InstagramAccountChecker(input_file, output_file)
+    asyncio.run(checker.start())
